@@ -68,7 +68,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
         ["⚠️ Audit", "📊 Export"],
     ],
     resize_keyboard=True,
-    persistent=True,
+    is_persistent=True,
 )
 
 # ── Session helpers ───────────────────────────────────────────────────────────
