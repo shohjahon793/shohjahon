@@ -1,25 +1,19 @@
 """
 LogiCheck - Accounting & Logistics Telegram Bot
-Powered by Google Gemini (Free)
+Powered by Google Gemini + Google Sheets
 """
 
 import os
 import io
+import json
 import logging
 from datetime import datetime, timedelta
 import google.generativeai as genai
-import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+import gspread
+from google.oauth2.service_account import Credentials
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    filters,
-    ContextTypes,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from telegram.constants import ParseMode
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -30,19 +24,51 @@ genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 model = genai.GenerativeModel(
     model_name="gemini-1.5-flash",
     system_instruction="""You are "LogiCheck," an expert AI Accounting & Logistics Assistant for a motor carrier company. Your primary responsibility is to prevent costly accounting errors, flag payment holds, and assist with financial reconciliations.
-
-Your communication style is concise, clear, and direct—optimized for Telegram chat interface. Use simple Markdown (bold with *, bullet points).
-
-When user mentions payment holds, deductions, missing docs (PODs/BOL), rate conflicts — acknowledge and categorize:
+Your communication style is concise, clear, and direct. Use simple Markdown (bold with *, bullet points).
+When user mentions payment holds, deductions, missing docs, rate conflicts — acknowledge and categorize:
 Labels: [CARRIER HOLD], [DRIVER DEDUCTION], [VENDOR ALERT], [MISSING DOCS], [RATE CONFLICT]
-
-PRE-PAYMENT AUDIT TRIGGER phrases: "processing payments", "running payouts", "starting settlements", "pre-payment check", "run audit", "audit now"
-When triggered: generate full audit report of all active flags.
-
-Keep responses short, bullet points, mobile-friendly.
-Never process or approve payments yourself — only audit and flag.
-"""
+PRE-PAYMENT AUDIT TRIGGER: "processing payments", "running payouts", "starting settlements", "run audit", "audit now"
+Keep responses short, bullet points, mobile-friendly. Never process payments yourself."""
 )
+
+# ── Google Sheets setup ───────────────────────────────────────────────────────
+SHEET_ID = "1c3DpHm5KSJex93CvhfZFDnqZz0D-0LruTEMBvKEuyVA"
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+def get_sheets_client():
+    creds_json = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+    creds = Credentials.from_service_account_info(creds_json, scopes=SCOPES)
+    return gspread.authorize(creds)
+
+def get_week_number(date: datetime) -> str:
+    return f"W{date.isocalendar()[1]}"
+
+def append_to_sheet(tab_name: str, row: list):
+    try:
+        gc = get_sheets_client()
+        sh = gc.open_by_key(SHEET_ID)
+        ws = sh.worksheet(tab_name)
+        ws.append_row(row, value_input_option="USER_ENTERED")
+        return True
+    except Exception as e:
+        logger.error(f"Sheets error: {e}")
+        return False
+
+# ── Type lists ────────────────────────────────────────────────────────────────
+DEDUCTION_TYPES = [
+    "Registration", "Scale", "Parking", "Layover", "Flight",
+    "Truck wash", "Escrow back", "Travel expense", "Toll", "Dispatch fee",
+    "Cash advance", "DOT", "Fridge", "Oregon permit", "Truck repair",
+    "Driver charge", "Fuel", "Other"
+]
+
+REIMBURSEMENT_TYPES = [
+    "Fridge", "Trip expense", "Cleaning supplies", "Cash advance",
+    "Fleet service", "Windshield wipers", "Truck repair", "Scale",
+    "Detention", "T-handle", "Fax", "Coolant", "Fuel", "Straps",
+    "Parking", "Tire gauge", "Maintenance", "Taxi", "Bonus",
+    "Truck cleaning", "Other"
+]
 
 # ── In-memory state per user ──────────────────────────────────────────────────
 user_sessions: dict[int, dict] = {}
@@ -55,57 +81,39 @@ FLAG_KEYWORDS = {
     "[RATE CONFLICT]": "RATE CONFLICT",
 }
 
-AUDIT_TRIGGER_KEYWORDS = [
+AUDIT_KEYWORDS = [
     "processing payments", "running payouts", "starting settlements",
     "pre-payment check", "run audit", "audit now", "payment run",
-    "send payments", "batch payment", "process payroll", "run payroll",
 ]
 
-# ── Main persistent keyboard ──────────────────────────────────────────────────
+# ── Main keyboard ─────────────────────────────────────────────────────────────
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        ["📋 Records", "➕ Add New"],
-        ["⚠️ Audit", "📊 Export"],
-    ],
-    resize_keyboard=True,
-    is_persistent=True,
+    [["📋 Records", "➕ Add New"], ["⚠️ Audit", "📊 Export"]],
+    resize_keyboard=True, is_persistent=True,
 )
 
 # ── Session helpers ───────────────────────────────────────────────────────────
-
 def get_session(user_id: int) -> dict:
     if user_id not in user_sessions:
         user_sessions[user_id] = {
             "chat": model.start_chat(history=[]),
-            "flags": [],
-            "flag_counter": 0,
-            "records": [],
-            "record_counter": 0,
-            "awaiting": None,  # tracks what input we're waiting for
-            "export_filter": {},  # tracks export filter state
+            "flags": [], "flag_counter": 0,
+            "records": [], "record_counter": 0,
+            "awaiting": None,
+            "pending_record": {},
         }
     return user_sessions[user_id]
 
-
-def next_record_id(session: dict) -> str:
+def next_id(session: dict) -> str:
     session["record_counter"] += 1
     return f"#{session['record_counter']:03d}"
-
-
-def get_week_label(date: datetime) -> str:
-    monday = date - timedelta(days=date.weekday())
-    return f"Week of {monday.strftime('%m/%d/%Y')}"
-
 
 def add_flag(session: dict, category: str, note: str) -> str:
     session["flag_counter"] += 1
     fid = f"F{session['flag_counter']:03d}"
-    session["flags"].append({
-        "id": fid, "category": category, "note": note,
-        "timestamp": datetime.now().strftime("%H:%M"), "resolved": False,
-    })
+    session["flags"].append({"id": fid, "category": category, "note": note,
+                              "timestamp": datetime.now().strftime("%H:%M"), "resolved": False})
     return fid
-
 
 def resolve_flag(session: dict, flag_id: str) -> bool:
     for f in session["flags"]:
@@ -113,7 +121,6 @@ def resolve_flag(session: dict, flag_id: str) -> bool:
             f["resolved"] = True
             return True
     return False
-
 
 def build_flags_summary(session: dict) -> str:
     open_flags = [f for f in session["flags"] if not f.get("resolved")]
@@ -133,295 +140,135 @@ def build_flags_summary(session: dict) -> str:
             lines.append(f"  • `[{f['id']}]` {f['category']} — {f['note']}")
     return "\n".join(lines)
 
-
-def parse_new_record(text: str) -> dict | None:
-    parts = [p.strip() for p in text.split("-")]
-    if len(parts) < 3:
-        return None
-    try:
-        unit = parts[0] if parts[0] else "N/A"
-        name = parts[1]
-        amount = float(parts[2].replace("$", "").replace(",", ""))
-        ptype = parts[3].lower() if len(parts) > 3 else "deduction"
-        payment_method = parts[4] if len(parts) > 4 else "—"
-        note = parts[5] if len(parts) > 5 else "—"
-        if not name or not amount or not ptype:
-            return None
-        return {"unit": unit, "name": name, "amount": amount,
-                "payment_type": ptype, "payment_method": payment_method, "note": note}
-    except (ValueError, IndexError):
-        return None
-
-
-def filter_records(records: list, by: str = None, value: str = None, period: str = None) -> list:
-    result = records
-
-    # Filter by field
-    if by and value and value.lower() != "all":
-        if by == "name":
-            result = [r for r in result if r["name"].lower() == value.lower()]
-        elif by == "unit":
-            result = [r for r in result if str(r["unit"]).lower() == value.lower()]
-        elif by == "type":
-            result = [r for r in result if r["payment_type"].lower() == value.lower()]
-
-    # Filter by period
-    if period:
-        now = datetime.now()
-        if period == "this_week":
-            monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0)
-            result = [r for r in result if r["datetime"] >= monday]
-        elif period == "last_week":
-            monday = (now - timedelta(days=now.weekday() + 7)).replace(hour=0, minute=0, second=0)
-            sunday = monday + timedelta(days=6, hours=23, minutes=59)
-            result = [r for r in result if monday <= r["datetime"] <= sunday]
-        elif period == "this_month":
-            start = now.replace(day=1, hour=0, minute=0, second=0)
-            result = [r for r in result if r["datetime"] >= start]
-        elif period == "last_month":
-            first_this = now.replace(day=1, hour=0, minute=0, second=0)
-            last_end = first_this - timedelta(seconds=1)
-            last_start = last_end.replace(day=1, hour=0, minute=0, second=0)
-            result = [r for r in result if last_start <= r["datetime"] <= last_end]
-
-    return result
-
-
-def build_excel(records: list, title_label: str) -> bytes:
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "LogiCheck Records"
-
-    col_widths = {"A": 20, "B": 14, "C": 22, "D": 12, "E": 18, "F": 14, "G": 12, "H": 12, "I": 12, "J": 30, "K": 18}
-    for col, width in col_widths.items():
-        ws.column_dimensions[col].width = width
-
-    header_fill = PatternFill(start_color="1F3864", end_color="1F3864", fill_type="solid")
-    header_font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    thin = Side(style="thin", color="CCCCCC")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-    ws.merge_cells("A1:K1")
-    title_cell = ws["A1"]
-    title_cell.value = f"LogiCheck — {title_label}"
-    title_cell.font = Font(name="Arial", bold=True, size=13, color="1F3864")
-    title_cell.alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[1].height = 28
-
-    headers = {"A": "Week Of", "B": "Date", "C": "Driver Name", "D": "Unit #",
-               "E": "Payment Type", "F": "Amount ($)", "G": "", "H": "", "I": "", "J": "Note", "K": "Payment Method"}
-    for col_letter, header in headers.items():
-        cell = ws[f"{col_letter}2"]
-        cell.value = header
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = header_align
-        cell.border = border
-    ws.row_dimensions[2].height = 22
-
-    type_colors = {"deduction": "FFF2CC", "reimbursement": "E2EFDA", "bonus": "DDEEFF", "wagehold": "FCE4D6"}
-    alt_colors  = {"deduction": "FFF9E6", "reimbursement": "F0F9EC", "bonus": "EEF6FF", "wagehold": "FEF0EB"}
-    data_font = Font(name="Arial", size=10)
-    center = Alignment(horizontal="center", vertical="center")
-    left = Alignment(horizontal="left", vertical="center", wrap_text=True)
-
-    for i, r in enumerate(records):
-        row = i + 3
-        ptype = r["payment_type"].lower()
-        fill_color = type_colors.get(ptype, "FFFFFF") if i % 2 == 0 else alt_colors.get(ptype, "F9F9F9")
-        row_fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type="solid")
-        dt = r["datetime"]
-        values = {"A": get_week_label(dt), "B": dt.strftime("%m/%d/%Y"), "C": r["name"], "D": r["unit"],
-                  "E": r["payment_type"].title(), "F": r["amount"], "G": "", "H": "", "I": "", "J": r["note"], "K": r["payment_method"]}
-        for col_letter, val in values.items():
-            cell = ws[f"{col_letter}{row}"]
-            cell.value = val
-            cell.font = data_font
-            cell.fill = row_fill
-            cell.border = border
-            if col_letter == "F":
-                cell.number_format = '$#,##0.00'
-                cell.alignment = center
-            elif col_letter in ("A", "B", "D", "E", "K"):
-                cell.alignment = center
-            else:
-                cell.alignment = left
-        ws.row_dimensions[row].height = 18
-
-    total_row = len(records) + 3
-    ws[f"A{total_row}"].value = "TOTAL"
-    ws[f"A{total_row}"].font = Font(name="Arial", bold=True, size=10)
-    ws[f"A{total_row}"].alignment = center
-    ws[f"F{total_row}"].value = f"=SUM(F3:F{total_row - 1})" if records else 0
-    ws[f"F{total_row}"].font = Font(name="Arial", bold=True, size=10, color="FFFFFF")
-    ws[f"F{total_row}"].number_format = '$#,##0.00'
-    ws[f"F{total_row}"].alignment = center
-    ws[f"F{total_row}"].fill = PatternFill(start_color="1F3864", end_color="1F3864", fill_type="solid")
-    ws.freeze_panes = "A3"
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf.read()
-
-
-def call_gemini(session: dict, user_message: str) -> str:
-    is_audit = any(kw in user_message.lower() for kw in AUDIT_TRIGGER_KEYWORDS)
+def call_gemini(session: dict, text: str) -> str:
+    is_audit = any(kw in text.lower() for kw in AUDIT_KEYWORDS)
     open_flags = [f for f in session["flags"] if not f.get("resolved")]
-    flags_context = ""
+    ctx = ""
     if open_flags:
-        flag_list = "\n".join(f"  - [{f['id']}] {f['category']}: {f['note']}" for f in open_flags)
-        flags_context = f"\n\n[SYSTEM CONTEXT — Active flags:]\n{flag_list}"
-    if is_audit:
-        augmented = f"{user_message}{flags_context}\n\n[SYSTEM: PRE-PAYMENT AUDIT triggered.]"
-    else:
-        augmented = user_message + flags_context
-    response = session["chat"].send_message(augmented)
-    return response.text
-
+        ctx = "\n\n[Active flags:]\n" + "\n".join(f"  - [{f['id']}] {f['category']}: {f['note']}" for f in open_flags)
+    msg = text + ctx + ("\n\n[SYSTEM: PRE-PAYMENT AUDIT triggered.]" if is_audit else "")
+    return session["chat"].send_message(msg).text
 
 # ── Inline keyboards ──────────────────────────────────────────────────────────
-
 def records_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💸 Deductions", callback_data="rec_deduction"),
-         InlineKeyboardButton("💚 Reimbursements", callback_data="rec_reimbursement")],
-        [InlineKeyboardButton("⭐ Bonuses", callback_data="rec_bonus"),
-         InlineKeyboardButton("🔴 Wage Holds", callback_data="rec_wagehold")],
-        [InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")],
+        [InlineKeyboardButton("💸 Deductions", callback_data="rec_Deductions"),
+         InlineKeyboardButton("💚 Reimbursements", callback_data="rec_Reimbursements")],
+        [InlineKeyboardButton("🔙 Back", callback_data="main_menu")],
     ])
-
 
 def add_new_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💸 Deduction", callback_data="add_deduction"),
          InlineKeyboardButton("💚 Reimbursement", callback_data="add_reimbursement")],
-        [InlineKeyboardButton("⭐ Bonus", callback_data="add_bonus"),
-         InlineKeyboardButton("🔴 Wage Hold", callback_data="add_wagehold")],
-        [InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")],
+        [InlineKeyboardButton("⭐ Bonus", callback_data="add_bonus")],
+        [InlineKeyboardButton("🔙 Back", callback_data="main_menu")],
     ])
-
 
 def audit_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔍 Run Audit", callback_data="audit_run"),
          InlineKeyboardButton("📋 View Flags", callback_data="audit_flags")],
-        [InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")],
+        [InlineKeyboardButton("🔙 Back", callback_data="main_menu")],
     ])
-
 
 def export_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👤 By Name", callback_data="export_by_name"),
-         InlineKeyboardButton("🚛 By Unit", callback_data="export_by_unit")],
-        [InlineKeyboardButton("📋 By Type", callback_data="export_by_type"),
-         InlineKeyboardButton("📅 By Period", callback_data="export_by_period")],
-        [InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")],
+        [InlineKeyboardButton("👤 By Name", callback_data="export_name"),
+         InlineKeyboardButton("🚛 By Unit", callback_data="export_unit")],
+        [InlineKeyboardButton("📋 By Type", callback_data="export_type"),
+         InlineKeyboardButton("📅 By Period", callback_data="export_period")],
+        [InlineKeyboardButton("🔙 Back", callback_data="main_menu")],
     ])
 
+def type_buttons(types: list, prefix: str):
+    rows = []
+    row = []
+    for i, t in enumerate(types):
+        row.append(InlineKeyboardButton(t, callback_data=f"{prefix}_{t[:30]}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="show_add")])
+    return InlineKeyboardMarkup(rows)
 
-def period_menu(prefix: str):
+def dynamic_filter_buttons(session: dict, field: str, prefix: str):
+    values = list(set(str(r.get(field, "")) for r in session["records"] if r.get(field)))
+    rows = [[InlineKeyboardButton("All", callback_data=f"{prefix}_ALL")]]
+    row = []
+    for v in sorted(values):
+        row.append(InlineKeyboardButton(v, callback_data=f"{prefix}_{v[:30]}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🔙 Export Menu", callback_data="show_export")])
+    return InlineKeyboardMarkup(rows)
+
+def period_buttons(prefix: str):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("This Week", callback_data=f"{prefix}_this_week"),
          InlineKeyboardButton("Last Week", callback_data=f"{prefix}_last_week")],
         [InlineKeyboardButton("This Month", callback_data=f"{prefix}_this_month"),
          InlineKeyboardButton("Last Month", callback_data=f"{prefix}_last_month")],
         [InlineKeyboardButton("All", callback_data=f"{prefix}_all")],
-        [InlineKeyboardButton("🔙 Export Menu", callback_data="export_menu")],
+        [InlineKeyboardButton("🔙 Export Menu", callback_data="show_export")],
     ])
 
+def filter_by_period(records: list, period: str) -> list:
+    now = datetime.now()
+    if period == "this_week":
+        monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0)
+        return [r for r in records if r["datetime"] >= monday]
+    elif period == "last_week":
+        monday = (now - timedelta(days=now.weekday() + 7)).replace(hour=0, minute=0, second=0)
+        sunday = monday + timedelta(days=6, hours=23, minutes=59)
+        return [r for r in records if monday <= r["datetime"] <= sunday]
+    elif period == "this_month":
+        start = now.replace(day=1, hour=0, minute=0, second=0)
+        return [r for r in records if r["datetime"] >= start]
+    elif period == "last_month":
+        first = now.replace(day=1, hour=0, minute=0, second=0)
+        end = first - timedelta(seconds=1)
+        start = end.replace(day=1, hour=0, minute=0, second=0)
+        return [r for r in records if start <= r["datetime"] <= end]
+    return records
 
-def name_filter_menu(session: dict):
-    names = list(set(r["name"] for r in session["records"]))
-    buttons = [[InlineKeyboardButton("All", callback_data="fname_all")]]
-    row = []
-    for name in names:
-        row.append(InlineKeyboardButton(name, callback_data=f"fname_{name}"))
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    buttons.append([InlineKeyboardButton("🔙 Export Menu", callback_data="export_menu")])
-    return InlineKeyboardMarkup(buttons)
-
-
-def unit_filter_menu(session: dict):
-    units = list(set(str(r["unit"]) for r in session["records"]))
-    buttons = [[InlineKeyboardButton("All", callback_data="funit_all")]]
-    row = []
-    for unit in units:
-        row.append(InlineKeyboardButton(unit, callback_data=f"funit_{unit}"))
-        if len(row) == 3:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    buttons.append([InlineKeyboardButton("🔙 Export Menu", callback_data="export_menu")])
-    return InlineKeyboardMarkup(buttons)
-
-
-def type_filter_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("All", callback_data="ftype_all")],
-        [InlineKeyboardButton("💸 Deduction", callback_data="ftype_deduction"),
-         InlineKeyboardButton("💚 Reimbursement", callback_data="ftype_reimbursement")],
-        [InlineKeyboardButton("⭐ Bonus", callback_data="ftype_bonus"),
-         InlineKeyboardButton("🔴 Wage Hold", callback_data="ftype_wagehold")],
-        [InlineKeyboardButton("🔙 Export Menu", callback_data="export_menu")],
-    ])
-
-
-# ── Send Excel helper ─────────────────────────────────────────────────────────
-
-async def send_excel(message, records: list, label: str):
+def format_records_list(records: list, title: str) -> str:
     if not records:
-        await message.reply_text("⚠️ No records found for this filter.", reply_markup=MAIN_KEYBOARD)
-        return
-    excel_bytes = build_excel(records, label)
-    filename = f"LogiCheck_{label.replace(' ', '_').replace('/', '-')}_{datetime.now().strftime('%m%d%Y')}.xlsx"
-    await message.reply_document(
-        document=io.BytesIO(excel_bytes),
-        filename=filename,
-        caption=(
-            f"📊 *LogiCheck Export*\n"
-            f"Filter: *{label}*\n"
-            f"Records: *{len(records)}*\n"
-            f"Total: *${sum(r['amount'] for r in records):,.2f}*"
-        ),
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=MAIN_KEYBOARD,
-    )
+        return f"*{title}*\n\nNo records found."
+    lines = [f"*{title}* — {len(records)} record(s)\n"]
+    for r in records:
+        lines.append(
+            f"`{r['id']}` *{r['name']}* | Unit {r['unit']} | "
+            f"${r['amount']:,.2f} | {r['type']} | _{r.get('note', '—')}_"
+        )
+    lines.append(f"\n💰 *Total: ${sum(r['amount'] for r in records):,.2f}*")
+    return "\n".join(lines)
 
-
-# ── Command & message handlers ────────────────────────────────────────────────
-
+# ── Command handlers ──────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     get_session(update.effective_user.id)
     await update.message.reply_text(
-        "👋 *LogiCheck Online*\n"
-        "Accounting & Logistics Safety Net — Active\n\n"
-        "Use the menu below to get started:",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=MAIN_KEYBOARD,
+        "👋 *LogiCheck Online*\nAccounting & Logistics Safety Net — Active\n\nUse the menu below:",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_KEYBOARD,
     )
-
 
 async def cmd_resolve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_session(update.effective_user.id)
     if not context.args:
-        await update.message.reply_text("⚠️ Usage: `/resolve F001`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("Usage: `/resolve F001`", parse_mode=ParseMode.MARKDOWN)
         return
-    flag_id = context.args[0].upper()
-    if resolve_flag(session, flag_id):
-        await update.message.reply_text(f"✅ Flag `{flag_id}` resolved.", parse_mode=ParseMode.MARKDOWN)
+    fid = context.args[0].upper()
+    if resolve_flag(session, fid):
+        await update.message.reply_text(f"✅ Flag `{fid}` resolved.", parse_mode=ParseMode.MARKDOWN)
     else:
-        await update.message.reply_text(f"❌ Flag `{flag_id}` not found.", parse_mode=ParseMode.MARKDOWN)
-
+        await update.message.reply_text(f"❌ Flag `{fid}` not found.", parse_mode=ParseMode.MARKDOWN)
 
 # ── Callback handler ──────────────────────────────────────────────────────────
-
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -437,59 +284,77 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("📋 *Records*\nChoose a category:", parse_mode=ParseMode.MARKDOWN, reply_markup=records_menu())
 
     elif data.startswith("rec_"):
-        ptype = data.replace("rec_", "")
-        emoji_map = {"deduction": "💸", "reimbursement": "💚", "bonus": "⭐", "wagehold": "🔴"}
-        emoji = emoji_map.get(ptype, "📄")
-        filtered = [r for r in session["records"] if r["payment_type"].lower() == ptype]
-        if not filtered:
-            msg = f"{emoji} *{ptype.title()}s*\n\nNo records yet."
-        else:
-            lines = [f"{emoji} *{ptype.title()}s* — {len(filtered)} record(s)\n"]
-            for r in filtered:
-                lines.append(f"`{r['id']}` *{r['name']}* | Unit {r['unit']} | ${r['amount']:,.2f} | {r['payment_method']} | _{r['note']}_")
-            lines.append(f"\n💰 *Total: ${sum(r['amount'] for r in filtered):,.2f}*")
-            msg = "\n".join(lines)
+        tab = data.replace("rec_", "")
+        filtered = [r for r in session["records"] if r.get("tab") == tab]
+        msg = format_records_list(filtered, tab)
         await query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=records_menu())
 
     # ── ADD NEW ──
     elif data == "show_add":
-        await query.message.reply_text("➕ *Add New Record*\nChoose type:", parse_mode=ParseMode.MARKDOWN, reply_markup=add_new_menu())
+        await query.message.reply_text("➕ *Add New*\nChoose type:", parse_mode=ParseMode.MARKDOWN, reply_markup=add_new_menu())
 
-    elif data.startswith("add_"):
-        ptype = data.replace("add_", "")
-        session["awaiting"] = f"new_record_{ptype}"
+    elif data == "add_deduction":
+        session["pending_record"] = {"tab": "Deductions", "category": "deduction"}
+        session["awaiting"] = "select_type"
         await query.message.reply_text(
-            f"➕ *New {ptype.title()}*\n\n"
-            f"Send in this format:\n"
-            f"`Unit - Name - Amount - Type - PaymentMethod - Note`\n\n"
-            f"*Required:* Name, Amount\n"
-            f"*Example:*\n`2154 - Jama Ahmed - 2500 - {ptype} - Check - Cash advance`",
+            "💸 *New Deduction*\nSelect type:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=type_buttons(DEDUCTION_TYPES, "dtype"),
+        )
+
+    elif data == "add_reimbursement":
+        session["pending_record"] = {"tab": "Reimbursements", "category": "reimbursement"}
+        session["awaiting"] = "select_type"
+        await query.message.reply_text(
+            "💚 *New Reimbursement*\nSelect type:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=type_buttons(REIMBURSEMENT_TYPES, "rtype"),
+        )
+
+    elif data == "add_bonus":
+        session["pending_record"] = {"tab": "Reimbursements", "category": "bonus", "type": "Bonus"}
+        session["awaiting"] = "enter_details"
+        await query.message.reply_text(
+            "⭐ *New Bonus*\n\nSend details in this format:\n"
+            "`Unit - Driver Name - Amount - Note(optional) - PaymentMethod(optional)`\n\n"
+            "Example:\n`2154 - Jama Ahmed - 300 - Safety bonus - Zelle`",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+    elif data.startswith("dtype_") or data.startswith("rtype_"):
+        ptype = data.split("_", 1)[1]
+        session["pending_record"]["type"] = ptype
+        session["awaiting"] = "enter_details"
+        cat = session["pending_record"]["category"]
+        emoji = "💸" if cat == "deduction" else "💚"
+        await query.message.reply_text(
+            f"{emoji} *Type: {ptype}*\n\nSend details:\n"
+            "`Unit - Driver Name - Amount - Note(optional) - PaymentMethod(optional)`\n\n"
+            "Example:\n`2154 - Jama Ahmed - 2500 - Trailer tire repair - EFS`",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=ReplyKeyboardRemove(),
         )
 
     # ── AUDIT ──
     elif data == "show_audit":
-        await query.message.reply_text("⚠️ *Audit*\nChoose an option:", parse_mode=ParseMode.MARKDOWN, reply_markup=audit_menu())
+        await query.message.reply_text("⚠️ *Audit*", parse_mode=ParseMode.MARKDOWN, reply_markup=audit_menu())
 
     elif data == "audit_run":
         open_flags = [f for f in session["flags"] if not f.get("resolved")]
         records = session["records"]
+        deductions = [r for r in records if r.get("tab") == "Deductions"]
+        reimbursements = [r for r in records if r.get("tab") == "Reimbursements"]
         totals = (
-            f"\n📊 *TOTALS:*\n"
-            f"  💸 Deductions: ${sum(r['amount'] for r in records if r['payment_type']=='deduction'):,.2f}\n"
-            f"  💚 Reimbursements: ${sum(r['amount'] for r in records if r['payment_type']=='reimbursement'):,.2f}\n"
-            f"  ⭐ Bonuses: ${sum(r['amount'] for r in records if r['payment_type']=='bonus'):,.2f}\n"
-            f"  🔴 Wage Holds: ${sum(r['amount'] for r in records if r['payment_type']=='wagehold'):,.2f}\n"
-            f"  📋 Total Records: {len(records)}"
+            f"\n📊 *SESSION TOTALS:*\n"
+            f"  💸 Deductions: ${sum(r['amount'] for r in deductions):,.2f} ({len(deductions)} records)\n"
+            f"  💚 Reimbursements/Bonuses: ${sum(r['amount'] for r in reimbursements):,.2f} ({len(reimbursements)} records)"
         )
         if not open_flags:
-            msg = "✅ *PRE-PAYMENT AUDIT*\n\nNo active flags.\n*Cleared to process payments.*\n" + totals
+            msg = "✅ *PRE-PAYMENT AUDIT*\n\nNo active flags.\n*Cleared to process.*\n" + totals
         else:
             items = "\n".join(f"  • `[{f['id']}]` *{f['category']}* — {f['note']}" for f in open_flags)
-            msg = (f"⚠️ *PRE-PAYMENT AUDIT*\n\n🔴 *{len(open_flags)} UNRESOLVED FLAG(S)*\n\n{items}\n\n"
-                   f"❗ *Do NOT process until all flags resolved.*\n"
-                   f"Use `/resolve [ID]` to clear.\n" + totals)
+            msg = f"⚠️ *PRE-PAYMENT AUDIT*\n\n🔴 *{len(open_flags)} UNRESOLVED*\n\n{items}\n\n❗ Resolve all before processing.\n" + totals
         await query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=audit_menu())
 
     elif data == "audit_flags":
@@ -498,176 +363,187 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         resolved_count = len([f for f in session["flags"] if f.get("resolved")])
         await query.message.reply_text(
             summary + f"\n\n📊 *{open_count} open* | ✅ *{resolved_count} resolved*",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=audit_menu(),
+            parse_mode=ParseMode.MARKDOWN, reply_markup=audit_menu(),
         )
 
-    # ── EXPORT MENU ──
-    elif data in ("show_export", "export_menu"):
-        await query.message.reply_text("📊 *Export Excel*\nFilter by:", parse_mode=ParseMode.MARKDOWN, reply_markup=export_menu())
+    # ── EXPORT ──
+    elif data == "show_export":
+        await query.message.reply_text("📊 *Export*\nFilter by:", parse_mode=ParseMode.MARKDOWN, reply_markup=export_menu())
 
-    # ── EXPORT BY NAME ──
-    elif data == "export_by_name":
+    elif data == "export_name":
         if not session["records"]:
             await query.message.reply_text("⚠️ No records yet.", reply_markup=export_menu())
         else:
-            await query.message.reply_text("👤 *Export by Name*\nSelect a driver:", parse_mode=ParseMode.MARKDOWN, reply_markup=name_filter_menu(session))
+            await query.message.reply_text("👤 Select driver:", reply_markup=dynamic_filter_buttons(session, "name", "fname"))
+
+    elif data == "export_unit":
+        if not session["records"]:
+            await query.message.reply_text("⚠️ No records yet.", reply_markup=export_menu())
+        else:
+            await query.message.reply_text("🚛 Select unit:", reply_markup=dynamic_filter_buttons(session, "unit", "funit"))
+
+    elif data == "export_type":
+        if not session["records"]:
+            await query.message.reply_text("⚠️ No records yet.", reply_markup=export_menu())
+        else:
+            await query.message.reply_text("📋 Select type:", reply_markup=dynamic_filter_buttons(session, "type", "ftype"))
+
+    elif data == "export_period":
+        await query.message.reply_text("📅 Select period:", reply_markup=period_buttons("ponly"))
 
     elif data.startswith("fname_"):
         value = data.replace("fname_", "")
-        session["export_filter"] = {"by": "name", "value": value}
-        label = "All Drivers" if value == "all" else value
-        await query.message.reply_text(f"📅 Select period for *{label}*:", parse_mode=ParseMode.MARKDOWN, reply_markup=period_menu("pname"))
-
-    elif data.startswith("pname_"):
-        period = data.replace("pname_", "")
-        ef = session["export_filter"]
-        records = filter_records(session["records"], by=ef.get("by"), value=ef.get("value"), period=period if period != "all" else None)
-        label = f"Name: {ef.get('value', 'All')} | {period.replace('_', ' ').title()}"
-        await send_excel(query.message, records, label)
-
-    # ── EXPORT BY UNIT ──
-    elif data == "export_by_unit":
-        if not session["records"]:
-            await query.message.reply_text("⚠️ No records yet.", reply_markup=export_menu())
-        else:
-            await query.message.reply_text("🚛 *Export by Unit*\nSelect a unit:", parse_mode=ParseMode.MARKDOWN, reply_markup=unit_filter_menu(session))
+        session["export_filter"] = {"field": "name", "value": value}
+        await query.message.reply_text(f"📅 Select period for *{value}*:", parse_mode=ParseMode.MARKDOWN, reply_markup=period_buttons("pfname"))
 
     elif data.startswith("funit_"):
         value = data.replace("funit_", "")
-        session["export_filter"] = {"by": "unit", "value": value}
-        label = "All Units" if value == "all" else f"Unit {value}"
-        await query.message.reply_text(f"📅 Select period for *{label}*:", parse_mode=ParseMode.MARKDOWN, reply_markup=period_menu("punit"))
-
-    elif data.startswith("punit_"):
-        period = data.replace("punit_", "")
-        ef = session["export_filter"]
-        records = filter_records(session["records"], by=ef.get("by"), value=ef.get("value"), period=period if period != "all" else None)
-        label = f"Unit: {ef.get('value', 'All')} | {period.replace('_', ' ').title()}"
-        await send_excel(query.message, records, label)
-
-    # ── EXPORT BY TYPE ──
-    elif data == "export_by_type":
-        await query.message.reply_text("📋 *Export by Type*\nSelect a type:", parse_mode=ParseMode.MARKDOWN, reply_markup=type_filter_menu())
+        session["export_filter"] = {"field": "unit", "value": value}
+        await query.message.reply_text(f"📅 Select period for unit *{value}*:", parse_mode=ParseMode.MARKDOWN, reply_markup=period_buttons("pfunit"))
 
     elif data.startswith("ftype_"):
         value = data.replace("ftype_", "")
-        session["export_filter"] = {"by": "type", "value": value}
-        label = "All Types" if value == "all" else value.title()
-        await query.message.reply_text(f"📅 Select period for *{label}*:", parse_mode=ParseMode.MARKDOWN, reply_markup=period_menu("ptype"))
+        session["export_filter"] = {"field": "type", "value": value}
+        await query.message.reply_text(f"📅 Select period for *{value}*:", parse_mode=ParseMode.MARKDOWN, reply_markup=period_buttons("pftype"))
 
-    elif data.startswith("ptype_"):
-        period = data.replace("ptype_", "")
-        ef = session["export_filter"]
-        records = filter_records(session["records"], by=ef.get("by"), value=ef.get("value"), period=period if period != "all" else None)
-        label = f"Type: {ef.get('value', 'All').title()} | {period.replace('_', ' ').title()}"
-        await send_excel(query.message, records, label)
+    elif data.startswith("ponly_") or data.startswith("pfname_") or data.startswith("pfunit_") or data.startswith("pftype_"):
+        parts = data.split("_", 1)
+        prefix = parts[0]
+        period = parts[1]
 
-    # ── EXPORT BY PERIOD ONLY ──
-    elif data == "export_by_period":
-        session["export_filter"] = {"by": None, "value": None}
-        await query.message.reply_text("📅 *Export by Period*\nSelect a period:", parse_mode=ParseMode.MARKDOWN, reply_markup=period_menu("ponly"))
+        records = session["records"]
+        ef = session.get("export_filter", {})
 
-    elif data.startswith("ponly_"):
-        period = data.replace("ponly_", "")
-        records = filter_records(session["records"], period=period if period != "all" else None)
-        label = period.replace("_", " ").title()
-        await send_excel(query.message, records, label)
+        if ef.get("field") and ef.get("value") and ef["value"] != "ALL":
+            records = [r for r in records if str(r.get(ef["field"], "")).lower() == ef["value"].lower()]
 
+        if period != "all":
+            records = filter_by_period(records, period)
+
+        label = f"{ef.get('value', 'All')} | {period.replace('_', ' ').title()}"
+        msg = format_records_list(records, f"Export: {label}")
+        await query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=export_menu())
 
 # ── Main message handler ──────────────────────────────────────────────────────
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_session(update.effective_user.id)
     text = update.message.text.strip()
 
-    # ── Persistent keyboard button taps ──
+    # Persistent keyboard buttons
     if text == "📋 Records":
-        await update.message.reply_text("📋 *Records*\nChoose a category:", parse_mode=ParseMode.MARKDOWN, reply_markup=records_menu())
+        await update.message.reply_text("📋 *Records*\nChoose:", parse_mode=ParseMode.MARKDOWN, reply_markup=records_menu())
         return
     elif text == "➕ Add New":
-        await update.message.reply_text("➕ *Add New Record*\nChoose type:", parse_mode=ParseMode.MARKDOWN, reply_markup=add_new_menu())
+        await update.message.reply_text("➕ *Add New*\nChoose type:", parse_mode=ParseMode.MARKDOWN, reply_markup=add_new_menu())
         return
     elif text == "⚠️ Audit":
-        await update.message.reply_text("⚠️ *Audit*\nChoose an option:", parse_mode=ParseMode.MARKDOWN, reply_markup=audit_menu())
+        await update.message.reply_text("⚠️ *Audit*", parse_mode=ParseMode.MARKDOWN, reply_markup=audit_menu())
         return
     elif text == "📊 Export":
-        await update.message.reply_text("📊 *Export Excel*\nFilter by:", parse_mode=ParseMode.MARKDOWN, reply_markup=export_menu())
+        await update.message.reply_text("📊 *Export*\nFilter by:", parse_mode=ParseMode.MARKDOWN, reply_markup=export_menu())
         return
 
-    # ── Awaiting new record input ──
-    if session.get("awaiting") and session["awaiting"].startswith("new_record_"):
-        ptype = session["awaiting"].replace("new_record_", "")
-        record = parse_new_record(text)
-        if not record:
+    # Awaiting record details input
+    if session.get("awaiting") == "enter_details":
+        parts = [p.strip() for p in text.split("-")]
+        if len(parts) < 3:
             await update.message.reply_text(
-                "❌ Wrong format. Use:\n`Unit - Name - Amount - Type - PaymentMethod - Note`\n\nExample:\n`2154 - Jama Ahmed - 2500 - deduction - Check - Cash advance`",
+                "❌ Need at least: `Unit - Name - Amount`\n\nExample:\n`2154 - Jama Ahmed - 2500`",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
 
-        record["payment_type"] = ptype
-        rid = next_record_id(session)
+        try:
+            unit = parts[0]
+            name = parts[1]
+            amount = float(parts[2].replace("$", "").replace(",", ""))
+            note = parts[3] if len(parts) > 3 else ""
+            payment_method = parts[4] if len(parts) > 4 else ""
+        except (ValueError, IndexError):
+            await update.message.reply_text(
+                "❌ Wrong format. Use:\n`Unit - Name - Amount - Note - PaymentMethod`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
         now = datetime.now()
-        record.update({"id": rid, "datetime": now, "date": now.strftime("%m/%d/%Y %H:%M")})
+        pending = session["pending_record"]
+        tab = pending.get("tab", "Deductions")
+        ptype = pending.get("type", "Other")
+        category = pending.get("category", "deduction")
+
+        record = {
+            "id": next_id(session), "datetime": now,
+            "unit": unit, "name": name, "amount": amount,
+            "type": ptype, "note": note, "payment_method": payment_method,
+            "tab": tab, "category": category,
+        }
         session["records"].append(record)
         session["awaiting"] = None
+        session["pending_record"] = {}
 
-        if record["payment_type"].lower() == "wagehold":
-            add_flag(session, "CARRIER HOLD", f"Wage hold — {record['name']} ${record['amount']:,.2f}")
+        # Write to Google Sheets
+        week = get_week_number(now)
+        date_str = now.strftime("%m/%d/%Y")
 
-        emoji_map = {"deduction": "💸", "reimbursement": "💚", "bonus": "⭐", "wagehold": "🔴"}
-        emoji = emoji_map.get(record["payment_type"].lower(), "📄")
+        if tab == "Deductions":
+            # Columns: A=Week, B=Date, C=Driver, D=Unit, E=Type, F=Amount, G=Deducted, H=Left, I=Deducted period, J=Note, K=Payment method
+            row = [week, date_str, name, unit, ptype, amount, "", "", "", note, payment_method]
+        else:
+            # Reimbursements: A=Week, B=Date, C=Driver, D=Unit, E=Type, F=Amount, J=Note, K=Payment method
+            row = [week, date_str, name, unit, ptype, amount, "", "", "", note, payment_method]
+
+        success = append_to_sheet(tab, row)
+
+        emoji_map = {"deduction": "💸", "reimbursement": "💚", "bonus": "⭐"}
+        emoji = emoji_map.get(category, "📄")
+        sheet_status = "✅ Saved to Google Sheet" if success else "⚠️ Sheet save failed — check connection"
 
         await update.message.reply_text(
-            f"{emoji} *{record['payment_type'].title()} Added* `{rid}`\n\n"
-            f"🚛 *Unit:* {record['unit']}\n"
-            f"👤 *Driver:* {record['name']}\n"
-            f"💰 *Amount:* ${record['amount']:,.2f}\n"
-            f"📋 *Type:* {record['payment_type'].title()}\n"
-            f"💳 *Method:* {record['payment_method']}\n"
-            f"📝 *Note:* {record['note']}\n"
-            f"📅 *Week:* {get_week_label(now)}",
+            f"{emoji} *{category.title()} Added*\n\n"
+            f"🚛 *Unit:* {unit}\n"
+            f"👤 *Driver:* {name}\n"
+            f"💰 *Amount:* ${amount:,.2f}\n"
+            f"📋 *Type:* {ptype}\n"
+            f"📝 *Note:* {note or '—'}\n"
+            f"💳 *Method:* {payment_method or '—'}\n"
+            f"📅 *Week:* {week}\n\n"
+            f"{sheet_status}",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=MAIN_KEYBOARD,
         )
         return
 
-    # ── Gemini AI fallback ──
+    # Gemini AI fallback
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     reply = call_gemini(session, text)
-
     for kw, category in FLAG_KEYWORDS.items():
         if kw in reply:
-            note = text[:120] + ("..." if len(text) > 120 else "")
-            fid = add_flag(session, category, note)
+            fid = add_flag(session, category, text[:120])
             reply = reply.replace(kw, f"{kw} `[{fid}]`", 1)
-
     try:
         await update.message.reply_text(reply[:4000], parse_mode=ParseMode.MARKDOWN, reply_markup=MAIN_KEYBOARD)
     except Exception:
         await update.message.reply_text(reply[:4000], reply_markup=MAIN_KEYBOARD)
 
-
 # ── Entry point ───────────────────────────────────────────────────────────────
-
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise ValueError("TELEGRAM_BOT_TOKEN not set.")
     if not os.environ.get("GEMINI_API_KEY"):
         raise ValueError("GEMINI_API_KEY not set.")
+    if not os.environ.get("GOOGLE_CREDENTIALS"):
+        raise ValueError("GOOGLE_CREDENTIALS not set.")
 
     app = Application.builder().token(token).build()
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("resolve", cmd_resolve))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("LogiCheck bot starting (Gemini + Buttons)...")
+    logger.info("LogiCheck bot starting (Gemini + Google Sheets)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
