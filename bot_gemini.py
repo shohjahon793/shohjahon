@@ -32,7 +32,7 @@ Keep responses short, bullet points, mobile-friendly. Never process payments you
 )
 
 # ── Google Sheets setup ───────────────────────────────────────────────────────
-SHEET_ID = "1c3DpHm5KSJex93CvhfZFDnqZz0D-0LruTEMBvKEuyVA"
+SHEET_ID = "1uhTIApaOLznW_BI_vFtyubbBs67hM5l6rZB0H-zOYyg"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 def get_sheets_client():
